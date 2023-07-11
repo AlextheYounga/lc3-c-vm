@@ -10,6 +10,10 @@
 #include <sys/termios.h>
 #include <sys/mman.h>
 
+/* 
+* LC3 Instructions: https://www.jmeiners.com/lc3-vm/supplies/lc3-isa.pdf
+* Guide: https://www.jmeiners.com/lc3-vm/
+*/
 
 /* 
 * Registers
@@ -85,6 +89,58 @@ enum
 };
 
 
+/* 
+* Trap Codes
+*/
+enum
+{
+    TRAP_GETC = 0x20,  /* get character from keyboard, not echoed onto the terminal */
+    TRAP_OUT = 0x21,   /* output a character */
+    TRAP_PUTS = 0x22,  /* output a word string */
+    TRAP_IN = 0x23,    /* get character from keyboard, echoed onto the terminal */
+    TRAP_PUTSP = 0x24, /* output a byte string */
+    TRAP_HALT = 0x25   /* halt the program */
+};
+
+
+/*
+* Update Flags
+* Any time a value is written to a register, we need to update the flags to indicate its sign. 
+* We will write a function so that this can be reused:
+*/
+void update_flags(uint16_t r)
+{
+    if (reg[r] == 0)
+    {
+        reg[R_COND] = FL_ZRO;
+    }
+    else if (reg[r] >> 15) /* a 1 in the left-most bit indicates negative */
+    {
+        reg[R_COND] = FL_NEG;
+    }
+    else
+    {
+        reg[R_COND] = FL_POS;
+    }
+}
+
+/*
+* Sign Extend
+* In addition immediate mode, the second number to add is embedded directly in the instruction itself.
+* The instruction must equal 16 bits, but storing the second number directly in instruction can cause a problem.
+* To do the addition, those 5 bits need to be extended to 16 to match the other number of the 16 bit int addition problem.
+* We are simply filling in the extra bits with either 0s if it's positive, or 1s if it's negative. 
+* More on negative numbers in binary: https://en.wikipedia.org/wiki/Two%27s_complement
+*/
+uint16_t sign_extend(uint16_t x, int bit_count)
+{
+    if ((x >> (bit_count - 1)) & 1) {
+        x |= (0xFFFF << bit_count);
+    }
+    return x;
+}
+
+
 /*
 * Procedure
 * 1. Load one instruction from memory at the address of the PC register.
@@ -132,51 +188,159 @@ int main(int argc, const char* argv[])
         switch (op)
         {
             case OP_ADD:
-                // @{ADD}
+                {
+                    /* destination register (DR) */
+                    uint16_t r0 = (instr >> 9) & 0x7;
+                    /* first operand (SR1) */
+                    uint16_t r1 = (instr >> 6) & 0x7;
+                    /* whether we are in immediate mode */
+                    uint16_t imm_flag = (instr >> 5) & 0x1;
+
+                    if (imm_flag)
+                    {
+                        uint16_t imm5 = sign_extend(instr & 0x1F, 5);
+                        reg[r0] = reg[r1] + imm5;
+                    }
+                    else
+                    {
+                        uint16_t r2 = instr & 0x7;
+                        reg[r0] = reg[r1] + reg[r2];
+                    }
+
+                    update_flags(r0);
+                }
                 break;
             case OP_AND:
-                // @{AND}
+                {
+                    uint16_t r0 = (instr >> 9) & 0x7;
+                    uint16_t r1 = (instr >> 6) & 0x7;
+                    uint16_t imm_flag = (instr >> 5) & 0x1;
+
+                    if (imm_flag)
+                    {
+                        uint16_t imm5 = sign_extend(instr & 0x1F, 5);
+                        reg[r0] = reg[r1] & imm5;
+                    }
+                    else
+                    {
+                        uint16_t r2 = instr & 0x7;
+                        reg[r0] = reg[r1] & reg[r2];
+                    }
+                    update_flags(r0);
+                }
                 break;
             case OP_NOT:
-                // @{NOT}
+                {
+                    uint16_t r0 = (instr >> 9) & 0x7;
+                    uint16_t r1 = (instr >> 6) & 0x7;
+
+                    reg[r0] = ~reg[r1];
+                    update_flags(r0);
+                }
                 break;
             case OP_BR:
-                // @{BR}
+                {
+                    uint16_t pc_offset = sign_extend(instr & 0x1FF, 9);
+                    uint16_t cond_flag = (instr >> 9) & 0x7;
+                    if (cond_flag & reg[R_COND])
+                    {
+                        reg[R_PC] += pc_offset;
+                    }
+                }
                 break;
             case OP_JMP:
-                // @{JMP}
+                {
+                    /* Also handles RET */
+                    uint16_t r1 = (instr >> 6) & 0x7;
+                    reg[R_PC] = reg[r1];
+                }
                 break;
             case OP_JSR:
-                // @{JSR}
+                {
+                    uint16_t long_flag = (instr >> 11) & 1;
+                    reg[R_R7] = reg[R_PC];
+                    if (long_flag)
+                    {
+                        uint16_t long_pc_offset = sign_extend(instr & 0x7FF, 11);
+                        reg[R_PC] += long_pc_offset;  /* JSR */
+                    }
+                    else
+                    {
+                        uint16_t r1 = (instr >> 6) & 0x7;
+                        reg[R_PC] = reg[r1]; /* JSRR */
+                    }
+                }
                 break;
             case OP_LD:
-                // @{LD}
+                {
+                    uint16_t r0 = (instr >> 9) & 0x7;
+                    uint16_t pc_offset = sign_extend(instr & 0x1FF, 9);
+                    reg[r0] = mem_read(reg[R_PC] + pc_offset);
+                    update_flags(r0);
+                }
                 break;
             case OP_LDI:
-                // @{LDI}
+                {
+                    /* destination register (DR) */
+                    uint16_t r0 = (instr >> 9) & 0x7;
+                    /* PCoffset 9*/
+                    uint16_t pc_offset = sign_extend(instr & 0x1FF, 9);
+                    /* add pc_offset to the current PC, look at that memory location to get the final address */
+                    reg[r0] = mem_read(mem_read(reg[R_PC] + pc_offset));
+                    update_flags(r0);
+                }
                 break;
             case OP_LDR:
-                // @{LDR}
+                {
+                    uint16_t r0 = (instr >> 9) & 0x7;
+                    uint16_t r1 = (instr >> 6) & 0x7;
+                    uint16_t offset = sign_extend(instr & 0x3F, 6);
+                    reg[r0] = mem_read(reg[r1] + offset);
+                    update_flags(r0);
+                }
                 break;
             case OP_LEA:
-                // @{LEA}
+                {
+                    uint16_t r0 = (instr >> 9) & 0x7;
+                    uint16_t pc_offset = sign_extend(instr & 0x1FF, 9);
+                    reg[r0] = reg[R_PC] + pc_offset;
+                    update_flags(r0);
+                }
                 break;
             case OP_ST:
-                // @{ST}
+                {
+                    uint16_t r0 = (instr >> 9) & 0x7;
+                    uint16_t pc_offset = sign_extend(instr & 0x1FF, 9);
+                    mem_write(reg[R_PC] + pc_offset, reg[r0]);
+                }
                 break;
             case OP_STI:
-                // @{STI}
+                {
+                    uint16_t r0 = (instr >> 9) & 0x7;
+                    uint16_t pc_offset = sign_extend(instr & 0x1FF, 9);
+                    mem_write(mem_read(reg[R_PC] + pc_offset), reg[r0]);
+                }
                 break;
             case OP_STR:
-                // @{STR}
+                {
+                    uint16_t r0 = (instr >> 9) & 0x7;
+                    uint16_t r1 = (instr >> 6) & 0x7;
+                    uint16_t offset = sign_extend(instr & 0x3F, 6);
+                    mem_write(reg[r1] + offset, reg[r0]);
+                }
                 break;
             case OP_TRAP:
+                /*
+                * The LC-3 provides a few predefined routines for performing common tasks and interacting with I/O devices. 
+                * For example, there are routines for getting input from the keyboard and for displaying strings to the console. 
+                * These are called trap routines which you can think of as the operating system or API for the LC-3. 
+                */
                 // @{TRAP}
                 break;
             case OP_RES:
             case OP_RTI:
             default:
-                // @{BAD OPCODE}
+                abort();
                 break;
         }
     }
